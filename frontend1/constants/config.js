@@ -1,0 +1,1 @@
+export const BACKEND_URL = "http://YOUR_BACKEND_IP:8000";
