@@ -14,62 +14,151 @@ import {
   useSpeechRecognitionEvent,
 } from 'expo-speech-recognition';
 
-const BACKEND_WS_URL   = 'ws://192.168.100.50:8000/ws/sensor';
-const BACKEND_HTTP_URL = 'http://192.168.100.50:8000/process_speech';
+const BACKEND_WS_URL     = 'ws://192.168.100.48:8000/ws';
 const SIMULATE_SENSOR    = true;
 const SENSOR_INTERVAL_MS = 300;
 
+// ── Modes ──────────────────────────────────────────────────────────────────────
+const MODE = {
+  IDLE:          'idle',
+  WS_SPEAKING:   'ws-speaking',
+  WAITING_REPLY: 'waiting-reply',
+  USER_SPEAK:    'user-speaking',
+  LISTENING:     'listening',
+};
+
+// ── TTS Queue & Priorities ─────────────────────────────────────────────────────
+const ttsQueue = []; // { text, targetMode, priority }
+let isProcessingTTS = false;
+
+const PRIORITY = {
+  ERROR:   100,
+  USER:     80,   // speech_response – conversation replies
+  SENSOR:   10,   // sensor_response – lowest priority
+};
+
 export default function App() {
-  const [status, setStatus]                 = useState('Ready');
+  const [status,         setStatus]         = useState('Ready');
   const [lastSensorData, setLastSensorData] = useState(null);
-  const [lastResponse, setLastResponse]     = useState('');
-  const [isListening, setIsListening]       = useState(false);
-  const [isSpeaking, setIsSpeaking]         = useState(false);
+  const [lastResponse,   setLastResponse]   = useState('');
+  const [mode,           setMode]           = useState(MODE.IDLE);
 
   const wsRef             = useRef(null);
   const sensorIntervalRef = useRef(null);
   const listeningTimeout  = useRef(null);
 
-  // ── Priority flag: true while user interaction is in progress ─────────────
-  // Blocks sensor WS messages from overriding the user's response.
-  const userInteractionActive = useRef(false);
+  // Mirror of mode for use in callbacks/closures
+  const modeRef = useRef(MODE.IDLE);
+  const setModeBoth = (m) => { modeRef.current = m; setMode(m); };
 
-  // ── Sync ref so resetListening() can read speaking state without stale closure ──
-  const isSpeakingRef = useRef(false);
+  // Flag to detect intentional interruptions
+  const interruptedRef = useRef(false);
 
-  // ── Reset helper ───────────────────────────────────────────────────────────
-  const resetListening = () => {
-    clearTimeout(listeningTimeout.current);
-    setIsListening(false);
-    setStatus('Ready');
-    // Only keep the priority lock alive if TTS is actively running.
-    // Use the ref (not state) so we always get the current value.
-    if (!isSpeakingRef.current) {
-      userInteractionActive.current = false;
+  // ── TTS Queue Logic ──────────────────────────────────────────────────────────
+  const enqueueTTS = (text, targetMode, priority = PRIORITY.SENSOR) => {
+    if (!text?.trim()) return;
+
+    ttsQueue.push({ text, targetMode, priority });
+    console.log(`[TTS] Enqueued → ${targetMode} (prio=${priority})  queue=${ttsQueue.length}`);
+
+    if (!isProcessingTTS) {
+      processNextTTS();
     }
   };
 
-  // ── WebSocket + sensor simulation ──────────────────────────────────────────
-  useEffect(() => {
-    const ws = new WebSocket(BACKEND_WS_URL);
-    ws.onopen    = () => setStatus('WebSocket connected');
-    ws.onmessage = (event) => {
-      // ✅ Drop sensor-triggered responses while user interaction is active
-      if (userInteractionActive.current) {
-        console.log('WS message suppressed — user interaction in progress');
-        return;
-      }
-      try {
-        const data = JSON.parse(event.data);
-        setLastResponse(data.response || 'No response text');
+  const processNextTTS = async () => {
+    if (ttsQueue.length === 0) {
+      isProcessingTTS = false;
+      return;
+    }
 
-        // speak(data.response || 'Got message but no text');
-      } catch (err) { console.error('WS parse error:', err); }
-    };
+    isProcessingTTS = true;
+
+    // Sort by priority DESC (highest first)
+    ttsQueue.sort((a, b) => b.priority - a.priority);
+    const { text, targetMode } = ttsQueue.shift();
+
+    const current = modeRef.current;
+
+    // Guard: skip if mode doesn't allow this type of speech
+    if (targetMode === MODE.WS_SPEAKING && current !== MODE.IDLE) {
+      console.log(`[TTS] Skipped sensor alert (mode=${current})`);
+      processNextTTS();
+      return;
+    }
+    if (targetMode === MODE.USER_SPEAK && current !== MODE.WAITING_REPLY) {
+      console.log(`[TTS] Skipped user reply (mode=${current})`);
+      processNextTTS();
+      return;
+    }
+
+    // Stop anything currently playing
+    interruptedRef.current = false;
+    Speech.stop();
+
+    setModeBoth(targetMode);
+    setLastResponse(text);
+
+    const statusText =
+      targetMode === MODE.USER_SPEAK ? 'Speaking reply…'
+      : targetMode === MODE.WS_SPEAKING ? `Alert: ${text.slice(0, 40)}`
+      : 'Processing…';
+
+    setStatus(statusText);
+
+    console.log(`[TTS] Playing → ${targetMode}: ${text.slice(0, 70)}`);
+
+    await new Promise((resolve) => {
+      const finish = () => {
+        if (!interruptedRef.current && modeRef.current === targetMode) {
+          setModeBoth(MODE.IDLE);
+          setStatus('Ready');
+        }
+        resolve();
+      };
+
+      Speech.speak(text, {
+        language: 'en-US',
+        pitch: 1.0,
+        rate: 0.95,
+        onDone: finish,
+        onError: finish,
+        onStopped: finish,
+      });
+    });
+
+    // Continue with next in queue
+    processNextTTS();
+  };
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    console.log('Connecting WebSocket…');
+    const ws = new WebSocket(BACKEND_WS_URL);
+
+    ws.onopen  = () => setStatus('Connected');
     ws.onerror = () => setStatus('WebSocket error');
     ws.onclose = () => setStatus('WebSocket closed');
-    wsRef.current = ws;
 
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const { type, response } = data;
+        console.log('[WS in]', type, '| mode=', modeRef.current);
+
+        if (type === 'sensor_response') {
+          enqueueTTS(response, MODE.WS_SPEAKING, PRIORITY.SENSOR);
+        } else if (type === 'speech_response') {
+          enqueueTTS(response, MODE.USER_SPEAK, PRIORITY.USER);
+        } else {
+          console.warn('[WS] Unknown type:', type);
+        }
+      } catch (err) {
+        console.error('WS parse error:', err);
+      }
+    };
+
+    wsRef.current = ws;
     if (SIMULATE_SENSOR) startSimulatedSensor(ws);
 
     return () => {
@@ -81,8 +170,8 @@ export default function App() {
   const startSimulatedSensor = (ws) => {
     sensorIntervalRef.current = setInterval(() => {
       const now = Date.now() / 1000;
-      const demoData = {
-        type: 'imu',
+      const payload = {
+        type: 'sensor',
         timestamp: now.toFixed(3),
         accelerometer: {
           x: (0.03 * Math.sin(now * 1.4) + (Math.random() - 0.5) * 0.03).toFixed(3),
@@ -95,147 +184,147 @@ export default function App() {
           z: (0.6  * Math.sin(now * 2.4) + (Math.random() - 0.5) * 0.12).toFixed(3),
         },
       };
-      setLastSensorData(demoData);
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(demoData));
+      setLastSensorData(payload);
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
     }, SENSOR_INTERVAL_MS);
   };
 
-  // ── Speech recognition events ──────────────────────────────────────────────
-  useSpeechRecognitionEvent('result', async (event) => {
-    if (!event.isFinal) return;
+  // ── Send user speech to backend ──────────────────────────────────────────────
+  const sendSpeechOverWS = (text) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'speech', text }));
+    } else {
+      enqueueTTS('Connection lost. Please try again.', MODE.USER_SPEAK, PRIORITY.ERROR);
+    }
+  };
 
-    const spokenText = event.results?.[0]?.transcript?.trim() ?? '';
-    console.log('Recognized:', spokenText);
+  // ── Start listening ──────────────────────────────────────────────────────────
+  const startListening = async () => {
+    setModeBoth(MODE.LISTENING);
+    setStatus('Listening… Speak now 🎙️');
 
-    if (!spokenText) {
-      speak('I did not hear anything. Please try again.');
-      resetListening();
+    listeningTimeout.current = setTimeout(() => {
+      console.warn('STT timeout');
+      try { ExpoSpeechRecognitionModule.abort(); } catch (_) {}
+      interruptedRef.current = true;
+      Speech.stop();
+      interruptedRef.current = false;
+      setModeBoth(MODE.WAITING_REPLY);
+      enqueueTTS('Listening timed out. Please try again.', MODE.USER_SPEAK, PRIORITY.ERROR);
+    }, 15000);
+
+    try {
+      ExpoSpeechRecognitionModule.start({
+        lang: 'en-US',
+        interimResults: false,
+        maxAlternatives: 1,
+        continuous: false,
+      });
+    } catch (err) {
+      console.error('start() threw:', err);
+      setModeBoth(MODE.WAITING_REPLY);
+      enqueueTTS('Could not start speech recognition.', MODE.USER_SPEAK, PRIORITY.ERROR);
+    }
+  };
+
+  // ── Button handler ───────────────────────────────────────────────────────────
+  const handleSpeakToBot = async () => {
+    const current = modeRef.current;
+    console.log(`[button] mode=${current}`);
+
+    if (current === MODE.LISTENING)     return;
+    if (current === MODE.USER_SPEAK)    return;
+    if (current === MODE.WAITING_REPLY) return;
+
+    if (current === MODE.WS_SPEAKING) {
+      // Interrupt sensor speech → go to listening
+      interruptedRef.current = true;
+      Speech.stop();
+      interruptedRef.current = false;
+      await startListening();
       return;
     }
 
-    setStatus(`You said: "${spokenText}"`);
-
-    try {
-      const res = await fetch(BACKEND_HTTP_URL, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ input_text: spokenText }),
-      });
-
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-
-      const data  = await res.json();
-      const reply = data.response || 'No reply from bot';
-      setLastResponse(reply);
-      speak(reply);           // userInteractionActive stays true until TTS done
-    } catch (err) {
-      console.error('Fetch error:', err);
-      setLastResponse('Error contacting server');
-      speak('Sorry, something went wrong reaching the server.');
-    } finally {
-      resetListening();
-    }
-  });
-
-  useSpeechRecognitionEvent('error', (event) => {
-    console.warn('STT error:', event.error, event.message);
-
-    const messages = {
-      'no-speech':   'I did not catch that. Please try again.',
-      'not-allowed': 'Microphone access was denied.',
-      'network':     'Network error during recognition.',
-      'aborted':     'Listening was cancelled.',
-    };
-
-    const msg = messages[event.error] ?? 'Speech recognition failed. Please try again.';
-    setLastResponse(msg);
-    speak(msg);
-    resetListening();
-  });
-
-  useSpeechRecognitionEvent('end', () => {
-    console.log('STT session ended');
-    resetListening();
-  });
-
-  // ── Start listening ────────────────────────────────────────────────────────
-  const handleSpeakToBot = async () => {
-    console.log('Button pressed: Speak to Bot');
-    if (isListening || isSpeaking) return;
-
-    // ✅ Mark user interaction as active — suppresses WS responses
-    userInteractionActive.current = true;
-
-    setStatus('Checking microphone permission…');
-    const { status: permStatus } = await Audio.requestPermissionsAsync();
-    if (permStatus !== 'granted') {
-      setStatus('Microphone permission denied');
-      speak('Please allow microphone access to speak to me.');
+    // Normal flow from IDLE
+    const { status: perm } = await Audio.requestPermissionsAsync();
+    if (perm !== 'granted') {
+      setModeBoth(MODE.WAITING_REPLY);
+      enqueueTTS('Please allow microphone access.', MODE.USER_SPEAK, PRIORITY.ERROR);
       return;
     }
 
     const available = await ExpoSpeechRecognitionModule.isAvailableAsync?.() ?? true;
     if (!available) {
-      setStatus('Speech recognition not available on this device');
-      speak('Speech recognition is not available on this device.');
+      setModeBoth(MODE.WAITING_REPLY);
+      enqueueTTS('Speech recognition is not available on this device.', MODE.USER_SPEAK, PRIORITY.ERROR);
       return;
     }
 
-    listeningTimeout.current = setTimeout(() => {
-      console.warn('STT timeout — forcing reset');
-      try { ExpoSpeechRecognitionModule.abort(); } catch (_) {}
-      speak('Listening timed out. Please try again.');
-      resetListening();
-    }, 15000);
+    await startListening();
+  };
 
-    setIsListening(true);
-    setStatus('Listening… Speak now 🎙️');
+  // ── Speech Recognition Events ────────────────────────────────────────────────
+  useSpeechRecognitionEvent('result', (event) => {
+    if (!event.isFinal) return;
+    clearTimeout(listeningTimeout.current);
 
-    try {
-      ExpoSpeechRecognitionModule.start({
-        lang:            'en-US',
-        interimResults:  false,
-        maxAlternatives: 1,
-        continuous:      false,
-      });
-    } catch (err) {
-      console.error('start() threw:', err);
-      speak('Could not start speech recognition.');
-      resetListening();
+    const spokenText = event.results?.[0]?.transcript?.trim() ?? '';
+    console.log('[STT result]', spokenText);
+
+    if (!spokenText) {
+      setModeBoth(MODE.WAITING_REPLY);
+      enqueueTTS('I did not hear anything. Please try again.', MODE.USER_SPEAK, PRIORITY.ERROR);
+      return;
     }
-  };
 
-  // ── TTS ────────────────────────────────────────────────────────────────────
-  const speak = async (text) => {
-    if (!text) return;
-    console.log('Speaking:', text);
-    Speech.stop();
-    isSpeakingRef.current = true;
-    setIsSpeaking(true);
-    await Speech.speak(text, {
-      language: 'en-US',
-      pitch:    1.0,
-      rate:     0.95,
-      onDone: () => {
-        isSpeakingRef.current = false;
-        setIsSpeaking(false);
-        // ✅ Release priority lock only after TTS finishes
-        userInteractionActive.current = false;
-      },
-      onError: () => {
-        isSpeakingRef.current = false;
-        setIsSpeaking(false);
-        userInteractionActive.current = false;
-      },
-      onStopped: () => {
-        isSpeakingRef.current = false;
-        setIsSpeaking(false);
-        userInteractionActive.current = false;
-      },
-    });
-  };
+    setStatus(`You said: "${spokenText}"`);
+    setModeBoth(MODE.WAITING_REPLY);
+    sendSpeechOverWS(spokenText);
+  });
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  useSpeechRecognitionEvent('error', (event) => {
+    console.warn('[STT error]', event.error);
+    clearTimeout(listeningTimeout.current);
+
+    if (event.error === 'aborted') return;
+
+    const messages = {
+      'no-speech':   'I did not catch that. Please try again.',
+      'not-allowed': 'Microphone access was denied.',
+      'network':     'Network error during recognition.',
+    };
+    const msg = messages[event.error] ?? 'Speech recognition failed. Please try again.';
+    setModeBoth(MODE.WAITING_REPLY);
+    enqueueTTS(msg, MODE.USER_SPEAK, PRIORITY.ERROR);
+  });
+
+  useSpeechRecognitionEvent('end', () => {
+    console.log('[STT end] mode=', modeRef.current);
+    clearTimeout(listeningTimeout.current);
+    if (modeRef.current === MODE.LISTENING) {
+      setModeBoth(MODE.IDLE);
+      setStatus('Ready');
+    }
+  });
+
+  // ── UI ───────────────────────────────────────────────────────────────────────
+  const isListening    = mode === MODE.LISTENING;
+  const isWsSpeaking   = mode === MODE.WS_SPEAKING;
+  const isUserSpeaking = mode === MODE.USER_SPEAK;
+  const isWaiting      = mode === MODE.WAITING_REPLY;
+  const isSpeaking     = isWsSpeaking || isUserSpeaking;
+
+  const buttonTitle =
+      isListening    ? '🎙️  Listening…'
+    : isWsSpeaking   ? '🎤  Interrupt & Speak'
+    : isUserSpeaking ? '🔊  Bot Speaking…'
+    : isWaiting      ? '⏳  Waiting for reply…'
+    :                  '🎤  Speak to Bot';
+
+  const buttonDisabled = isListening || isUserSpeaking || isWaiting;
+  const buttonColor    = isWsSpeaking ? '#FF5722' : '#2196F3';
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Voice Bot Demo</Text>
@@ -257,24 +346,23 @@ export default function App() {
 
       <View style={styles.buttonRow}>
         <Button
-          title={isListening ? '🎙️  Listening…' : '🎤  Speak to Bot'}
+          title={buttonTitle}
           onPress={handleSpeakToBot}
-          disabled={isListening || isSpeaking}
-          color="#2196F3"
+          disabled={buttonDisabled}
+          color={buttonColor}
         />
       </View>
 
-      {(isListening || isSpeaking) && (
+      {(isListening || isSpeaking || isWaiting) && (
         <ActivityIndicator
           size="large"
-          color={isListening ? '#2196F3' : '#FF5722'}
+          color={isListening ? '#2196F3' : isWaiting ? '#FF9800' : '#FF5722'}
           style={{ marginTop: 20 }}
         />
       )}
 
-      {isListening && (
-        <Text style={styles.hint}>Speak clearly into your microphone…</Text>
-      )}
+      {isListening && <Text style={styles.hint}>Speak clearly into your microphone…</Text>}
+      {isWaiting   && <Text style={styles.hint}>Processing your request…</Text>}
     </View>
   );
 }
